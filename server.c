@@ -10,19 +10,28 @@
 #include <malloc.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 
 #define MAXLEN 30
 #define CMDMAXLEN 11+2*MAXLEN
 #define MAXMESBUFLEN 1024
 #define DBUTENTI "dbutenti.txt"
 #define REGISTRO "registro.txt"
+#define HANGINGHDR "hanginghdr.txt"
 #define HANGING "hanging.txt"
 #define CPY "cpy.txt"
 
+//variabili di appoggio
+
 typedef struct sockaddr_in sockaddr_in;
-int listener;
+int listener, dport, ret;
+long login, logout;
+size_t len = 0;
+char *line = NULL, uname[MAXLEN];
+time_t sec;
 sockaddr_in addr, client;
 fd_set masterR;
+FILE *utenti, *online, *toSend, *cpy;
 
 struct message {
 
@@ -33,37 +42,70 @@ struct message {
 
 } typedef message;
 
-struct toInsert {
+struct peer {
 
+    char uname[MAXLEN];
     int sd, port;
-    struct toInsert *next;
+    struct peer *next;
 
-} typedef toInsert;
-toInsert *insertList = NULL;
+} typedef peer;
+peer *peerList = NULL;
 
 void insert(int sd, int port) {
-    toInsert *tmp = (toInsert*) malloc(sizeof(toInsert));
+    peer *tmp = (peer*) malloc(sizeof(peer));
     tmp->sd = sd;
     tmp->port = port;
 
-    if(insertList == NULL) {
+    if(peerList == NULL) {
         tmp->next = NULL;
-        insertList = tmp;
+        peerList = tmp;
         return;
     }
 
-    tmp->next = insertList;
-    insertList = tmp;
+    tmp->next = peerList;
+    peerList = tmp;
 }
 
-toInsert* extract(int sd) {
+peer* searchBySD (int sd) {
+    if(peerList == NULL) return NULL;
 
-    if(insertList == NULL) return NULL;
+    peer *p = peerList;
 
-    toInsert *p = insertList, *q;
+    while(p != NULL) {
+        if(p->sd == sd) {
+            return p;
+        }
+        p = p->next;
+    }
 
-    if(insertList->sd == sd) {
-        insertList = insertList->next;
+    return NULL;
+}
+
+int search(char *user, int *prt) {
+
+    if(peerList == NULL) return -1;
+
+    peer *p = peerList;
+
+    while(p != NULL) {
+        if(strcmp(p->uname, user) == 0) {
+            *prt = p->port;
+            return p->sd;
+        }
+        p = p->next;
+    }
+
+    return -1;
+}
+
+peer* extract(int sd) {
+
+    if(peerList == NULL) return NULL;
+
+    peer *p = peerList, *q;
+
+    if(peerList->sd == sd) {
+        peerList = peerList->next;
         return p;
     }
 
@@ -82,6 +124,17 @@ toInsert* extract(int sd) {
 
 }
 
+void flushList() {
+    if(peerList == NULL) return;
+
+    while(peerList != NULL) {
+        close(peerList->sd);
+        free((void*) extract(peerList->sd));
+    }
+
+}
+
+/*Modifica il registro ed inserisce una entry*/
 void setOnline(int sd, char *uname, int port) {
 
     time_t sec = time(NULL);
@@ -90,57 +143,44 @@ void setOnline(int sd, char *uname, int port) {
     fprintf(online, "%s %d %ld %ld %d\n", uname, port, sec, (long) 0, sd);
     fclose(online);
 
+    //associa al socket descriptor username e porta del client
+    peer *p = searchBySD(sd);
+    if(p != NULL) {
+        strcpy(p->uname, uname);
+        p->port = port;
+    }
+
 }
 
+/*Rimuove la entry dal registro con socket descriptor uguale a sd e timestamp di logout nullo*/
 void setOffline(int sd) {
     
-    FILE *online = fopen(REGISTRO, "r");
-    FILE *tmp = fopen(CPY, "a+");
-    if(online == NULL || tmp == NULL) return;
-    char uname[MAXLEN], *line = NULL;
+    online = fopen(REGISTRO, "a+");
+    cpy = fopen(CPY, "a+");
     int sdr, port;
-    long login, logout;
-    size_t len = 0;
 
     while(getline(&line, &len, online) != -1) {
         
         sscanf(line, "%s %d %ld %ld %d\n", uname, &port, &login, &logout, &sdr);
-        if(sd == sdr) {
-            time_t sec = time(NULL);
-            fprintf(tmp, "%s %d %ld %ld %d\n", uname, port, login, sec, sdr);
+        if(sd == sdr && logout == 0) {
+            sec = time(NULL);
+            fprintf(cpy, "%s %d %ld %ld %d\n", uname, port, login, sec, sdr);
         }
-        else fprintf(tmp, "%s", line);
+        else fprintf(cpy, "%s", line);
         
     }
 
     fclose(online);
-    fclose(tmp);
+    fclose(cpy);
     remove(REGISTRO);
     rename(CPY, REGISTRO);
 
 }
 
+/*Restituisce il sd di un utente se online altrimenti -1*/
 int isOnline(char *user, int *prt) {
 
-    FILE *online = fopen(REGISTRO, "r");
-    if(online == NULL) return -1;
-    char uname[MAXLEN+1], *line = NULL;
-    size_t len = 0;
-    int sdr, port;
-    long login, logout;
-
-    while(getline(&line, &len, online) != -1) {
-        sscanf(line, "%s %d %ld %ld %d\n", uname, &port, &login, &logout, &sdr);
-        if(strcmp(user, uname) == 0 && logout == 0) {
-            fclose(online);
-            *prt = port;
-            return sdr;
-        }
-    }
-
-    fclose(online);
-    *prt = -1;
-    return -1;
+    return search(user, prt);
 
 }
 
@@ -154,13 +194,18 @@ void sendMessage(message m, int sd) {
     send(sd, (void*)m.sender, MAXLEN, 0);
     send(sd, (void*)m.receiver, MAXLEN, 0);
 
-    send(sd, (void*)&m.buffer, MAXMESBUFLEN, 0);
+    uint16_t lmsg;
+    int length = strlen(m.buffer);
+    if(length < MAXMESBUFLEN) length++;
+    lmsg = htons(length);
+
+    send(sd, (void*)&lmsg, sizeof(uint16_t), 0);
+
+    send(sd, (void*)&m.buffer, length, 0);
 
 }
 
 int receiveMessage(message *m, int sd) {
-
-    int ret;
 
     ret = recv(sd, (void*) &(*m).type, sizeof(uint8_t), MSG_WAITALL);
     if(ret == 0) {  //il client e' andato offline, aggiornamento timestamp
@@ -204,7 +249,21 @@ int receiveMessage(message *m, int sd) {
                         
     else if(ret == -1) return ret;
 
-    ret = recv(sd, (void*) (*m).buffer, MAXMESBUFLEN, MSG_WAITALL);
+    uint16_t lmsg;
+    int length;
+
+    ret = recv(sd, (void*)&lmsg, sizeof(uint16_t), 0);
+    if(ret == 0) {
+        setOffline(sd);
+        FD_CLR(sd, &masterR);
+        close(sd);
+        return 0;
+    }
+                    
+    else if(ret == -1) return ret;
+    length = ntohs(lmsg);
+
+    ret = recv(sd, (void*) (*m).buffer, length, MSG_WAITALL);
     if(ret == 0) {
         setOffline(sd);
         FD_CLR(sd, &masterR);
@@ -226,30 +285,23 @@ void cmdlist() {
     printf("3)\tesc -> chiude il server\n");
 }
 
-void cleantstdin() {
-    char c;
-    do {
-        c = getchar();
-    } while (c != '\n' && c != EOF);
-}
+/*inizializza il socket di comunicazione con il server e si connette ad esso*/
+int socketSetup(int port) {
 
-int socketSetup(int port) {      //inizializza il socket di comunicazione con il server e si connette ad esso
-
-    int ret;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, "10.0.2.15", &addr.sin_addr);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if(listener == -1) {
-        perror("Impossibile creare un socket di comunicazione, errore: ");
+        perror("Impossibile creare un socket di comunicazione, errore");
         return -1;
     }
 
     ret = bind(listener, (struct sockaddr*) &addr, sizeof(addr));
     if(ret == -1) {
-        perror("Utilizzare un'altra porta, errore: ");
+        perror("Utilizzare un'altra porta, errore");
         close(listener);
         return -1;
     }
@@ -259,14 +311,14 @@ int socketSetup(int port) {      //inizializza il socket di comunicazione con il
 
 }
 
+/*Gestisce il comando list*/
 void list() {
 
     FILE *online = fopen(REGISTRO, "a+");
-    char *line = NULL, uname[MAXLEN];
+    line = NULL;
+    len = 0;
     int sd, port;
-    long login, logout;
     struct tm tin;
-    size_t len = 0;
 
     while(getline(&line, &len, online) != -1) {
         sscanf(line, "%s %d %ld %ld %d\n", uname, &port, &login, &logout, &sd);
@@ -280,11 +332,11 @@ void list() {
     
 }
 
+/*Restituisce 0 se lo username arg1 non è presente nel db altrimenti -1*/
 int checkUsername(char *arg1) {
-    FILE *utenti = fopen(DBUTENTI, "r");
-    char *line = NULL;
-    char uname[MAXLEN];
-    size_t len = 0;
+    utenti = fopen(DBUTENTI, "r");
+    line = NULL;
+    len = 0;
 
     while(getline(&line, &len, utenti) != -1) {
         sscanf(line, "%s", uname);
@@ -295,31 +347,35 @@ int checkUsername(char *arg1) {
     return 0;
 }
 
-void sendHanging(int type, char *uname) {
+/*Gestisce un comando di show da parte di un client*/
+void sendHanging(int type, char *sender, char *receiver) {
 
-    int usd, dport;
-    char *line = NULL;
-    size_t len = 0;
+    int usd;
+    line = NULL;
+    len = 0;
     message m;
-    FILE *tmp = fopen(HANGING, "a+");
-    FILE *cpy = fopen(CPY, "a+");
+    toSend = fopen(HANGING, "a+");
+    cpy = fopen(CPY, "a+");
 
-    while(getline(&line, &len, tmp) != -1) {
-        sscanf(line, "%d %d %s %s %99[^\n]", &m.type, &m.timestamp, m.sender, m.receiver, m.buffer);
-        if(strcmp(uname, m.receiver) == 0 && m.type == type) {
-            usd = isOnline(uname, &dport);
+    while(getline(&line, &len, toSend) != -1) {
+        sscanf(line, "%hhd %d %s %s %99[^\n]", &m.type, &m.timestamp, m.sender, m.receiver, m.buffer);
+        if(strcmp(sender, m.receiver) == 0 && m.type == type            //controlla se il ricevitore e' quello giusto e nel caso che sia specificato anche il trasmettitore
+            && (receiver == NULL || (receiver != NULL && strcmp(receiver, m.sender) == 0))) {
+            strcat(m.buffer, "\n");
+            usd = isOnline(sender, &dport);
             sendMessage(m, usd);
         }
         else fprintf(cpy, "%s", line);
     }
 
-    fclose(tmp);
+    fclose(toSend);
     fclose(cpy);
     remove(HANGING);
     rename(CPY, HANGING);
 
 }
 
+/*Registra un utente*/
 void signup(int sd, char *arg1, char *arg2, int port) {
     message ack;
     ack.type = 2;
@@ -331,7 +387,7 @@ void signup(int sd, char *arg1, char *arg2, int port) {
         return;
     }
 
-    FILE *utenti = fopen(DBUTENTI, "a+");
+    utenti = fopen(DBUTENTI, "a+");
     fprintf(utenti, "%s %s\n", arg1, arg2);
     fclose(utenti);
     setOnline(sd, arg1, port);
@@ -340,17 +396,22 @@ void signup(int sd, char *arg1, char *arg2, int port) {
     sendMessage(ack, sd);
 }
 
+/*Effettua il login di un utente controllando che i dati siano giusti*/
 int in(int sd, char *arg1, char *arg2, int port) {
-    FILE *utenti = fopen(DBUTENTI, "r");
-    char *line = NULL;
-    char uname[MAXLEN], pwd[MAXLEN];
-    size_t len = 0;
+    utenti = fopen(DBUTENTI, "r");
+    line = NULL;
+    len = 0;
+    char pwd[MAXLEN];
 
+    if(search(arg1, &dport) != -1) return -1;   //controlla se l'utente e' gia' online
+
+    //altrimenti controlla credenziali
     while(getline(&line, &len, utenti) != -1) {
-        sscanf(line, "%s %s", uname, pwd);
+        sscanf(line, "%s %s\n", uname, pwd);
         if((strcmp(uname, arg1) == 0) && (strcmp(pwd, arg2) == 0)) {
             fclose(utenti);
             setOnline(sd, arg1, port);
+            printf("L'utente %s si e' appena connesso\n", arg1);
             return 0;
         }
     }
@@ -359,14 +420,94 @@ int in(int sd, char *arg1, char *arg2, int port) {
     return -1;
 }
 
+/*Memorizza un messaggio da inviare ad un client attualmente offline*/
+void memorize(message m) {
+
+    toSend = fopen(HANGING, "a+");
+    fprintf(toSend, "%hhd %d %s %s %s", m.type, m.timestamp, m.sender, m.receiver, m.buffer);
+    fclose(toSend);
+
+    if(m.type == 4 || m.type == 6) {
+        toSend = fopen(HANGINGHDR, "a+");   //il file HANGINGHDR contiene per ogni combinazione di sender e receiver il numero totale di messaggi e il timestamp del più recente
+        cpy = fopen(CPY, "a+");
+        int count = 0, ts;
+        char sender[MAXLEN], receiver[MAXLEN];
+
+        while(getline(&line, &len, toSend) != -1) {
+            sscanf(line, "%s %s %d %u\n", sender, receiver, &count, &ts);
+            if(strcmp(m.sender, sender) == 0 && strcmp(m.receiver, receiver) == 0) {
+                count++;
+                fprintf(cpy, "%s %s %d %u\n", sender, receiver, count, ts);
+                count = -1;
+            }
+            else fprintf(cpy, "%s", line);
+        }
+
+        if(count != -1) {       //non esiste ancora un record
+            fprintf(cpy, "%s %s %d %d\n", m.sender, m.receiver, 1, m.timestamp);
+        }
+
+        fclose(toSend);
+        fclose(cpy);
+        remove(HANGINGHDR);
+        rename(CPY, HANGINGHDR);
+
+    }
+
+}
+
+void sendFile(char *name, char *uname) {
+
+    message m;
+    int usd, dport;
+
+    if(strlen(name) > MAXMESBUFLEN) {
+        printf("Nome file troppo lungo\n");
+        return;
+    }
+    FILE *ptr = fopen(name, "rb");
+    if(ptr == NULL) {
+        printf("Il file specificato non esiste\n");
+        return;
+    }
+
+    m.type = 8;
+    strcpy(m.buffer, name);
+
+    usd = search(uname, &dport);
+    if(usd == -1) {
+        printf("Impossibile condividere il file con l'utente specificato\n");
+        fclose(ptr);
+        return;
+    }
+
+    strcpy(m.sender, "\n");
+    sendMessage(m, usd);    //invio messaggio per avviare lo sharing
+
+    size_t ret_t = 1;
+    while(1) {  //legge ed invia al piu' MAXMESBUFLEN byte
+        memset(m.buffer, 0, MAXMESBUFLEN);     //pulizia
+        ret_t = fread(m.buffer, sizeof(*(m.buffer)), sizeof(m.buffer)/sizeof(*(m.buffer)), ptr);
+        if(ret_t == 0 || ret_t == EOF) break;     //EOF
+        m.timestamp = ret_t;       //popola con il numero di byte letti
+        sendMessage(m, usd);
+    }
+    fclose(ptr);
+
+    //invio messaggio fine sharing
+    m.type = 2;
+    memset(m.buffer, 0, MAXMESBUFLEN);
+    sendMessage(m, usd);
+
+}
+
 int main(int argc, char** argv) {
 
-    int port = 4242, sdclient, ret, maxfd = STDIN_FILENO, i = 0;
-    char cmd[CMDMAXLEN], choice[MAXLEN];
-    socklen_t len;
+    int port = 4242, sdclient, maxfd = STDIN_FILENO, i = 0;
+    char cmd[CMDMAXLEN];
+    socklen_t socklen;
     struct timeval timeout;
     fd_set readers;
-    FILE *utenti, *online, *toSend;
 
     //creazione del database e registro di utenti
     utenti = fopen(DBUTENTI, "a+");
@@ -376,14 +517,13 @@ int main(int argc, char** argv) {
     toSend = fopen(HANGING, "a+");
     fclose(toSend);
 
-
     FD_SET(STDIN_FILENO, &masterR);
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
 
     system("clear");
     if(argc > 2) {
-        printf("Numero di parametri eccessivo, .dev accetta al piu' un parametro\n");
+        printf("Numero di parametri eccessivo, inserire al piu' un parametro\n");
         return -1;
     }
     else if(argc == 2) port = atoi(argv[1]);
@@ -411,56 +551,56 @@ int main(int argc, char** argv) {
             if(FD_ISSET(i, &readers)) {
 
                 if(i == listener) {     //ricevuta una nuova richiesta
-                    len = sizeof(client);
-                    memset(&client, 0, len);
-                    sdclient = accept(listener, (struct sockaddr*) &client, &len);
+                    socklen = sizeof(client);
+                    memset(&client, 0, socklen);
+                    sdclient = accept(listener, (struct sockaddr*) &client, &socklen);
                     FD_SET(sdclient, &masterR);
                     if(sdclient > maxfd) maxfd = sdclient;
-                    insert(sdclient, (int) client.sin_port);
+                    insert(sdclient, -1);
+                    printf("Una connessione con un client e' stata creata\n");
                 }
 
                 else if(i == STDIN_FILENO) {        //ricevuto un input da terminale
+                    memset(cmd, 0, CMDMAXLEN);
                     read(STDIN_FILENO, cmd, CMDMAXLEN);
-                    sscanf(cmd, "%s\n", choice);
-                    if(strcmp(choice, "help") == 0) {
-                        system("clear");
-                        printf("-list: mostra l'elenco degli utenti connessi indicando username, timestamp di connessione e porta\n");
-                        printf("-esc: chiude il server, non impedisce la continuazione di una chat gia' avviata ma non permette agli utenti di effettuare login\n");
+
+                    if(strcmp(cmd, "help\n") == 0) {
+                            system("clear");
+                            printf("-list: mostra l'elenco degli utenti connessi indicando username, timestamp di connessione e porta\n");
+                            printf("-esc: chiude il server, non impedisce la continuazione di una chat gia' avviata ma non permette agli utenti di effettuare login\n");
                     }
 
-                    else if(strcmp(choice, "list") == 0) {
+                    else if(strcmp(cmd, "list\n") == 0) {
                         system("clear");
                         list();
                     }
-
-                    else if(strcmp(choice, "esc") == 0) {
+                    
+                    else if(strcmp(cmd, "esc\n") == 0) {
                         printf("Chiusura server in corso...\n");
-                        int j;
-                        for(j = 0; j < maxfd + 1; j++) {
-                            if(FD_ISSET(j, &masterR)) close(j);
-                        }
-
+                        flushList();
+                        close(listener);
                         return 0;
                     }
 
-                    else {
-                        printf("Comando non valido...\n");
-                    }
-
-                    printf("Premere invio per continuare...\n");
-                    cleantstdin();
-                    while(getchar() != '\n');
-                    cmdlist();
+                    else cmdlist();
 
                 }
 
                 else {      //socket di comunicazione con un client pronto
 
                     message m;
-
                     ret = receiveMessage(&m, i);
                     
-                    if(ret == -1 || ret == 0) continue;
+                    if(ret == -1) continue;
+                    else if(ret == 0) {
+                        peer *p = extract(i);
+                        printf("L'utente %s si e' disconnesso\n", p->uname);
+                        setOffline(i);
+                        free(p);
+                        close(i);
+                        FD_CLR(i, &masterR);
+                        continue;
+                    }
 
                     char arg1[MAXLEN], arg2[MAXLEN];
                     int cport;
@@ -468,6 +608,7 @@ int main(int argc, char** argv) {
                     if(m.type == 0) {
                         sscanf(m.buffer, "%s %s %d\n", arg1, arg2, &cport);
                         signup(i, arg1, arg2, cport);
+                        printf("L'utente %s si e' appenna registrato\n", m.sender);
                     }
 
                     else if(m.type == 1) {
@@ -483,14 +624,13 @@ int main(int argc, char** argv) {
                         else {
                             strcpy(ack.buffer, "1\n");
                             sendMessage(ack, i);
-                            sendHanging(2, arg1);
-                            sendHanging(4, arg1);
+                            sendHanging(2, arg1, NULL);
                         }
 
                     }
 
                     else if(m.type == 2) {  //ricevuto ack
-
+                        printf("Ricevuto un messaggio avvenuta consegna da %s per %s\n", m.sender, m.receiver);
                         int dport;
                         sdclient = isOnline(m.receiver, &dport);
                         if(sdclient != -1) sendMessage(m, sdclient);
@@ -502,18 +642,40 @@ int main(int argc, char** argv) {
 
                     }
 
-                    else if(m.type == 4) {  //ricevuto un messaggio per iniziare una chat
+                    else if(m.type == 3) {  //ricevuto un timestamp di logout
+                        printf("Ricevuto un messaggio con timestamp di logout da %s\n", m.sender);
+                        online = fopen(REGISTRO, "a+");
+                        cpy = fopen(CPY, "a+");
+                        int sd, done = 0;   //variabile done per uscire al primo timestamp cambiato
+                        
+                        while(getline(&line, &len, online) != -1) {
+                            sscanf(line, "%s %d %ld %ld %d\n", uname, &dport, &login, &logout, &sd);
+                            if(strcmp(m.sender, uname) == 0 && logout == 0 && !done) {
+                                logout = m.timestamp;
+                                fprintf(cpy, "%s %d %ld %ld %d\n", uname, dport, login, logout, sd);
+                                done = 1;
+                            }
+                            else fprintf(cpy, "%s %d %ld %ld %d\n", uname, dport, login, logout, sd);
+                        }
 
-                        int dport;
+                        fclose(online);
+                        fclose(cpy);
+                        remove(REGISTRO);
+                        rename(CPY, REGISTRO);                        
+
+                    }
+
+                    else if(m.type == 4) {  //ricevuto un messaggio per iniziare una chat
+                        printf("Ricevuto un messaggio di avvio chat da %s per %s", m.sender, m.receiver);
                         sdclient = isOnline(m.receiver, &dport);
                         if (sdclient != -1) {   //peer online, recapito messaggio
+                            printf(", inoltro in corso...\n");
                             sendMessage(m, sdclient);
                         }
 
                         else {  //peer offline, bufferizzazione
-                            toSend = fopen(HANGING, "a+");
-                            fprintf(toSend, "%d %d %s %s %s", m.type, m.timestamp, m.sender, m.receiver, m.buffer);
-                            fclose(toSend);
+                            printf(". Peer offline, memorizzazione...\n");
+                            memorize(m);
                         }
 
                         message ack;
@@ -521,6 +683,73 @@ int main(int argc, char** argv) {
                         if(sdclient != -1) sprintf(ack.buffer, "%d\n", dport);
                         else sprintf(ack.buffer, "%d\n", -1);
                         sendMessage(ack, i);    //invio dati peer
+
+                    }
+
+                    else if(m.type == 5) {  //ricevuta una richiesta per ricevere la lista dei peer online
+                        printf("Invio lista dei peer online a %s\n", m.sender);
+                        remove(CPY);
+                        cpy = fopen(CPY, "a+");
+                        peer *p = peerList;
+                        while(p != NULL) {
+                            if(p->port != -1) fprintf(cpy, "%s %d\n", p->uname, p->port);
+                            p = p->next;
+                        }
+                        fclose(cpy);
+                        sendFile(CPY, m.sender);
+                        remove(CPY);
+                    }
+
+                    else if(m.type == 7) {
+
+                        if(strcmp(m.buffer, "list\n") == 0) {
+                            printf("Ricevuto un messaggio di hanging da %s\n", m.sender);
+                            toSend = fopen(HANGINGHDR, "r");
+                            if(toSend == NULL) {
+                                m.type = 2;
+                                sendMessage(m, i);
+                                continue;
+                            }
+
+                            int count = 0;
+                            message r;
+                            r.type = 7;
+
+                            while(getline(&line, &len, toSend) != -1) {
+                                sscanf(line, "%s %s %d %u\n", r.sender, uname, &count, &r.timestamp);
+                                if(strcmp(m.sender, uname) == 0) {
+                                    sprintf(r.buffer, "%d", count);
+                                    sendMessage(r, i);
+                                }
+                            }
+
+                            r.type = 2;
+                            sendMessage(r, i);
+                            fclose(toSend);
+                        }                        
+
+                        else if(strcmp(m.buffer, "send\n") == 0) {
+                            printf("Ricevuto un messaggio di show da %s\n", m.sender);
+                            sendHanging(4, m.sender, m.receiver);
+                            sendHanging(6, m.sender, m.receiver);
+
+                            toSend = fopen(HANGINGHDR, "a+");
+                            cpy = fopen(CPY, "a+");
+                            char receiver[MAXLEN];
+                            int count;
+                            uint32_t ts;
+
+                            while(getline(&line, &len, toSend) != -1) {
+                                sscanf(line, "%s %s %d %u\n", uname, receiver, &count, &ts);
+                                if(!(strcmp(m.sender, receiver) == 0 && strcmp(m.receiver, uname) == 0)) fprintf(cpy, "%s", line);
+                            }
+
+                            fclose(toSend);
+                            fclose(cpy);
+                            remove(HANGINGHDR);
+                            rename(CPY, HANGINGHDR);
+
+                        }
 
                     }
 
